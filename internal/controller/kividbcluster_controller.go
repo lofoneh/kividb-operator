@@ -79,6 +79,10 @@ type KividbClusterReconciler struct {
 	// demoteFencedMaster.
 	fencedRetries sync.Map
 
+	// restartWaits: the failovers waiting for their master to come back on
+	// its volume ("<ns>/<cluster>" -> *restartWaiting), see restart_wait.go.
+	restartWaits sync.Map
+
 	// notSynced: why each replica of a replicated-mode cluster was not in
 	// sync on the last pass ("<ns>/<cluster>" -> map[pod]reason).
 	notSynced sync.Map

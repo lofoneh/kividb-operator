@@ -7,9 +7,10 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 **Apply the new `kividbclusters` CRD before `helm upgrade`:** Helm does not
-upgrade it, and the status gains `pods[].podIP` and `fencedMaster`. Until it
-is applied, the API server drops them and failovers do not hold the old
-master's writes (`FailoverUnfenced` Warning).
+upgrade it, the status gains `pods[].podIP` and `fencedMaster`, and the spec
+gains `failover.restartWaitSeconds`. Until it is applied, the API server
+drops them: failovers do not hold the old master's writes
+(`FailoverUnfenced` Warning), and the restart wait keeps its default.
 
 ### Added
 
@@ -20,6 +21,28 @@ master's writes (`FailoverUnfenced` Warning).
   AllNamespaces mode.
 
 ### Fixed
+
+- **A failover could promote a replica that held less than another, and
+  did not wait for a force-deleted master coming back on its volume
+  (#78).** In an AKS run, a force-deleted master lost 176 acknowledged
+  writes, and the replica promoted was 640 bytes behind the other.
+  - The replica is now picked after the old master's writes are held (or
+    it is found gone), by each replica's offset read then with `ROLE`, not
+    by the offsets read at the start of the pass, which may be from before
+    the master stopped streaming. Replicas that hold as much go by
+    `replica-priority`, the lower first, then by name. A replica with
+    `replica-priority 0` is never promoted, as in Sentinel; when every
+    replica that could take over has it, the master stays gone and a
+    `FailoverBlocked` Warning says why.
+  - A master whose pod is gone, or is back with no Ready condition yet, and
+    whose engine no longer answers, is now waited for, for
+    `failover.restartWaitSeconds` (new, 15 s by default, 0 for not at
+    all): it may come back on its volume holding writes its replicas do
+    not. Back, it is compared with them as a master that restarted in
+    place is (#42), and kept if it holds as much. A replacement pod that
+    cannot be scheduled is not waited for. `FailoverWait` events say when
+    a wait starts and how it ended, and the Ready condition's reason is
+    `WaitingForMaster` meanwhile.
 
 - **`kubectl apply -k config/default` installed no `KividbDbOps` CRD.**
   `config/crd/kustomization.yaml` did not list it, so the documented install
