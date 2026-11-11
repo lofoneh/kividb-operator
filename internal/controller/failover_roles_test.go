@@ -215,6 +215,8 @@ type testPod struct {
 	// pending: just created, with no Ready condition yet; unschedulable:
 	// no node will take it.
 	pending, unschedulable bool
+	// createdAgo: when the pod object was made, if not left out.
+	createdAgo time.Duration
 }
 
 // object is p's pod object, in cluster c.
@@ -236,8 +238,12 @@ func (p testPod) object(c *kividbv1alpha1.KividbCluster) *corev1.Pod {
 	case p.pending:
 		conds = nil
 	}
+	var created metav1.Time
+	if p.createdAgo > 0 {
+		created = metav1.NewTime(time.Now().Add(-p.createdAgo))
+	}
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: p.name, Namespace: c.Namespace, Labels: labels, UID: p.uid},
+		ObjectMeta: metav1.ObjectMeta{Name: p.name, Namespace: c.Namespace, Labels: labels, UID: p.uid, CreationTimestamp: created},
 		Status: corev1.PodStatus{PodIP: p.ip, Conditions: conds,
 			ContainerStatuses: []corev1.ContainerStatus{{Name: kividbContainerName, RestartCount: p.restarts}}},
 	}

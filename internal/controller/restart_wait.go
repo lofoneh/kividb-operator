@@ -7,21 +7,29 @@ import (
 
 	kividbv1alpha1 "github.com/kividbio/kividb-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // Waiting for a master that may come back on its volume (#78).
 //
-// A master whose pod is force-deleted is failed away from at once: its pod
-// object is gone, or its replacement has no Ready condition yet. If its
+// A master whose pod is force-deleted used to be failed away from at once:
+// its pod object is gone, or its replacement (a new UID) not Ready. If its
 // engine still answers, the fence holds its writes and its replica catches
 // up (fence.go). But if its engine is already gone, the replacement pod may
 // be coming back on the same volume, holding writes it acknowledged that no
 // replica has; promoting a replica first would have them resynced away. So
-// the failover waits for it, for failover.restartWaitSeconds, and when it is
-// back compares it with its replicas as for a master that restarted in
-// place (regressedMaster, #42) before promoting anyone. A replacement that
-// cannot be scheduled is not waited for: its volume is not coming back
-// soon. Each wait, and how it ended, is an event (FailoverWait).
+// the failover waits for it, until its new pod is Ready and has reported,
+// and then compares it with its replicas as for a master that restarted in
+// place (regressedMaster, #42) before promoting anyone -- for
+// failover.restartWaitSeconds at most, counted from when it was found gone
+// (or its replacement made, whichever is earlier: an operator that
+// restarted does not wait it out again), whether its pod came back or not.
+// A replacement that cannot be scheduled is not waited for: its volume is
+// not coming back soon. The operator does not read Nodes to tell a node
+// that is not Ready, so that its RBAC stays as small as it is: the
+// scheduler keeps new pods off such a node, so a replacement pinned there
+// by its volume shows as unschedulable, and the cap covers the rest. Each
+// wait, and how it ended, is an event (FailoverWait).
 
 // defaultRestartWait is failover.restartWaitSeconds when not set.
 const defaultRestartWait = 15 * time.Second
@@ -42,10 +50,11 @@ type restartWaiting struct {
 }
 
 // waitForRestart returns an error -- the failover is to wait -- while the
-// master name, whose pod is gone or has not started yet (mv nil, or with no
-// Ready condition), may still come back on its volume; nil once it is not
-// worth waiting for: the wait is off, its engine still answers (the fence
-// holds it), its replacement pod cannot be scheduled, or the wait is over.
+// master name, whose pod is gone or replaced and not ready yet (mv nil, or
+// its replacement), may still come back on its volume; nil once the master
+// is to be failed away from: the wait is off, its engine still answers (the
+// fence holds it), its replacement pod cannot be scheduled, or the wait is
+// over.
 func (r *KividbClusterReconciler) waitForRestart(ctx context.Context, c *kividbv1alpha1.KividbCluster, name string, mv *podView, last kividbv1alpha1.KividbPodStatus) error {
 	key := c.Namespace + "/" + c.Name
 	limit := restartWait(c)
@@ -79,21 +88,34 @@ func (r *KividbClusterReconciler) waitForRestart(ctx context.Context, c *kividbv
 			"%s: its pod is gone and nothing answers at its address; waiting up to %s for it to come back on its volume, which may hold writes its replicas do not, before promoting one",
 			name, limit)
 	}
+	if mv != nil && !mv.pod.CreationTimestamp.IsZero() && mv.pod.CreationTimestamp.Time.Before(w.since) {
+		w.since = mv.pod.CreationTimestamp.Time // made before this operator saw it gone
+	}
 	if waited := now.Sub(w.since); waited < limit {
 		return heldBack("WaitingForMaster", fmt.Errorf("waiting up to %s for master %s to come back on its volume (%s so far)", limit, name, waited.Round(time.Second)))
 	}
 	return stop("%s did not come back on its volume within %s; failing over", name, limit)
 }
 
+// logRoles logs why a pass left the roles as they were. A wait it chose,
+// for a master to come back, is logged on every pass while it lasts, so at
+// info level: it is not a failure. Anything else is an error.
+func logRoles(ctx context.Context, err error) {
+	if held, ok := err.(*heldError); ok {
+		logf.FromContext(ctx).Info("roles held back", "reason", held.reason, "detail", held.Error())
+		return
+	}
+	logf.FromContext(ctx).Error(err, "role reconciliation failed")
+}
+
 // restartWaitOver ends the wait for the master of c, if there is one: its
-// pod is back (it has a Ready condition, or is ready). From here the
-// unhealthy threshold, and the comparison with its replicas, apply as to a
-// master that restarted in place.
+// pod is back, ready, and has reported. It is compared with its replicas
+// next, as a master that restarted in place.
 func (r *KividbClusterReconciler) restartWaitOver(c *kividbv1alpha1.KividbCluster) {
 	if v, ok := r.restartWaits.LoadAndDelete(c.Namespace + "/" + c.Name); ok {
 		w := v.(*restartWaiting)
 		r.event(c, corev1.EventTypeNormal, "FailoverWait",
-			"%s came back after %s (its pod has started); when it is ready it is compared with its replicas, as a master that restarted in place, and failed away from if it is not ready within unhealthyThresholdSeconds",
+			"%s came back after %s; it is compared with its replicas, as a master that restarted in place, before anything is promoted",
 			w.master, r.now().Sub(w.since).Round(time.Second))
 	}
 }

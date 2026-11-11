@@ -203,10 +203,12 @@ does, in order:
 5. **Election**: among the remaining ready pods with a
    `replica-priority` other than 0 (never promoted, as in Sentinel; none
    left: `FailoverBlocked`, no failover), the one with the highest
-   `replicationOffset`. A master whose pod is gone, or back with no Ready
-   condition yet, and whose engine no longer answers, is first waited for,
-   for `failover.restartWaitSeconds` (`FailoverWait`): back on its volume,
-   it goes through step 4's comparison instead. Before promoting anyone,
+   `replicationOffset`. A master whose pod is gone or replaced (a new
+   UID), and whose engine no longer answers, is first waited for until
+   its new pod is Ready and has reported, for `failover.restartWaitSeconds`
+   at most from when it was found gone (`FailoverWait`): back on its
+   volume in time, it goes through step 4's comparison instead. Before
+   promoting anyone,
    hold the old master's writes
    (`CLIENT PAUSE <ms> WRITE` through its agent, for the pod's
    termination grace period -- 10 s at least -- and 5 s more) at the

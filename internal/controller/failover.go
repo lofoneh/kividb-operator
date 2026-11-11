@@ -98,9 +98,6 @@ func (r *KividbClusterReconciler) reconcileRoles(ctx context.Context, c *kividbv
 
 	needsElection := currentMasterName == ""
 	needsFailover := false
-	// at once: the master's pod is gone, or back with no Ready condition
-	// yet, and nothing has had to wait for the unhealthy threshold.
-	atOnce := false
 	failoverHappened := false
 	newMasterName := currentMasterName
 
@@ -109,7 +106,6 @@ func (r *KividbClusterReconciler) reconcileRoles(ctx context.Context, c *kividbv
 		switch {
 		case !exists:
 			needsFailover = failoverEnabled // labeled master pod is gone entirely
-			atOnce = true
 		case mv.ready && mv.status != nil && mv.status.Role == agentapi.RoleReplica:
 			// The pod the operator considers master is healthy but kividb
 			// itself says it is a replica: something demoted it behind the
@@ -142,17 +138,28 @@ func (r *KividbClusterReconciler) reconcileRoles(ctx context.Context, c *kividbv
 				needsFailover = failoverEnabled && time.Since(since) >= threshold
 			} else if !mv.ready {
 				needsFailover = failoverEnabled
-				atOnce = true
 			}
 		}
 	}
 
-	// A master failed away from at once, whose engine no longer answers,
-	// may be coming back on its volume with writes no replica has: wait for
-	// it a while, so that the check below can compare it with them (#78).
-	if needsFailover && atOnce {
-		if err := r.waitForRestart(ctx, c, currentMasterName, views[currentMasterName], previous[currentMasterName]); err != nil {
-			return nil, currentMasterName, false, err
+	// A master whose pod is gone, or is another pod than the one recorded
+	// (deleted, force-deleted most likely, and made again by the
+	// StatefulSet), and whose engine no longer answers, may be coming back
+	// on its volume with writes no replica has (#78). Until its new pod is
+	// Ready and has reported -- the check below then compares it with its
+	// replicas, as a master that restarted in place -- it is waited for, and
+	// failed away from once failover.restartWaitSeconds have passed since
+	// it was found gone, whether its pod came back or not. A master that
+	// restarts in place keeps the unhealthy threshold above.
+	if mv, exists := views[currentMasterName]; currentMasterName != "" && failoverEnabled && (!exists || podReplaced(previous[currentMasterName], mv.pod)) {
+		switch {
+		case exists && mv.ready && mv.status != nil:
+			r.restartWaitOver(c)
+		default:
+			if err := r.waitForRestart(ctx, c, currentMasterName, mv, previous[currentMasterName]); err != nil {
+				return nil, currentMasterName, false, err
+			}
+			needsFailover = true
 		}
 	} else {
 		r.restartWaitOver(c)
@@ -607,6 +614,13 @@ func engineAtLeast(version string, major, minor int) bool {
 		return n[0] > major
 	}
 	return n[1] >= minor
+}
+
+// podReplaced reports whether pod is another pod than the one last
+// recorded under its name: a new UID. Nothing recorded is no.
+func podReplaced(last kividbv1alpha1.KividbPodStatus, pod *corev1.Pod) bool {
+	uid, _, _ := strings.Cut(last.Incarnation, "/")
+	return uid != "" && pod.UID != "" && string(pod.UID) != uid
 }
 
 // engineRestarted reports whether pod's engine has restarted since last

@@ -1,12 +1,17 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kividbio/kividb-operator/internal/agentapi"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 // A master whose pod is gone, and whose engine no longer answers, may be
@@ -20,6 +25,7 @@ func newGoneMasterHarness(t *testing.T) (*rolesHarness, *time.Time) {
 	h := newFenceHarness(t)
 	delete(h.agents.status, "10.0.0.1")
 	h.cluster.Status.Pods[0].ReplID = "stream-a"
+	h.cluster.Status.Pods[0].Incarnation = "old/0"
 	keyed(h.agents.status["10.0.0.2"], 5)
 	keyed(h.agents.status["10.0.0.3"], 5)
 	now := time.Now()
@@ -126,10 +132,82 @@ func TestFailover_DoesNotWaitForAPodThatCannotBeScheduled(t *testing.T) {
 	}
 }
 
+// The replacement pod has started -- it has a Ready condition, False -- but
+// is not ready: it is still waited for, but only until restartWaitSeconds
+// after the master was found gone, not unhealthyThresholdSeconds after it
+// started, so that a force-deleted master costs that much at most.
+func TestFailover_CapsTheWaitForAReplacementThatIsNotReady(t *testing.T) {
+	h, now := newGoneMasterHarness(t)
+	rec := h.recordEvents()
+	h.assertWaiting("at once")
+	*now = now.Add(5 * time.Second)
+	h.addPod(testPod{name: "c1-0", ip: "10.0.0.9", label: "master", uid: "new", unreadyFor: time.Second, agent: backOnItsVolume(5)})
+	h.assertWaiting("its pod started, not ready")
+	*now = now.Add(11 * time.Second)
+	h.assertFailoverTo("c1-1")
+	if e := eventsWith(rec, "FailoverWait"); len(e) != 2 || !strings.Contains(e[1], "did not come back") {
+		t.Errorf("events %v, want FailoverWait saying it did not come back in time", e)
+	}
+}
+
+// The cap counts from when the replacement pod was made, not from when this
+// operator first saw it: one restarted meanwhile does not wait it out again.
+func TestFailover_CapsTheWaitFromWhenTheReplacementWasMade(t *testing.T) {
+	h, _ := newGoneMasterHarness(t)
+	h.addPod(testPod{name: "c1-0", ip: "10.0.0.9", label: "master", uid: "new", unreadyFor: time.Second, createdAgo: 20 * time.Second, agent: backOnItsVolume(5)})
+	h.assertFailoverTo("c1-1")
+}
+
+// A master that restarts in place -- the same pod -- keeps the unhealthy
+// threshold: it is not a force-deleted master, and is not waited out
+// against restartWaitSeconds.
+func TestFailover_KeepsTheThresholdForAMasterThatRestartsInPlace(t *testing.T) {
+	h, now := newGoneMasterHarness(t)
+	rec := h.recordEvents()
+	h.cluster.Status.Pods[0].Incarnation = "same/0"
+	h.addPod(testPod{name: "c1-0", ip: "10.0.0.1", label: "master", uid: "same", unreadyFor: 5 * time.Second})
+	*now = now.Add(time.Minute)
+	if m, failover := h.reconcile(); m != "c1-0" || failover {
+		t.Fatalf("master=%q failover=%v, want no failover before unhealthyThresholdSeconds", m, failover)
+	}
+	if e := eventsWith(rec, "FailoverWait"); len(e) > 0 {
+		t.Errorf("unexpected %v", e)
+	}
+}
+
 // A replacement pod with no Ready condition yet is still on its way: the
 // failover waits for it, as for a pod that is gone.
 func TestFailover_WaitsForAReplacementPodNotStartedYet(t *testing.T) {
 	h, _ := newGoneMasterHarness(t)
 	h.addPod(testPod{name: "c1-0", uid: "new", pending: true})
 	h.assertWaiting("at once")
+}
+
+// The wait for a master to come back is logged on every pass while it
+// lasts. It is a decision, not a failure: logged at info level, with its
+// reason, not as an error with a stack trace. Anything else that keeps the
+// roles from being settled is still an error.
+func TestAWaitForTheMasterIsNotLoggedAsAnError(t *testing.T) {
+	var buf bytes.Buffer
+	ctx := logf.IntoContext(context.Background(), zap.New(zap.WriteTo(&buf)))
+	logRoles(ctx, heldBack("WaitingForMaster", errors.New("waiting up to 15s for master c1-0 to come back on its volume (4s so far)")))
+	logRoles(ctx, errors.New("reading the pods' roles: connection refused"))
+
+	var lines []map[string]any
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(l), &line); err != nil {
+			t.Fatalf("log line %q: %v", l, err)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("%d log lines, want 2: %s", len(lines), buf.String())
+	}
+	if wait := lines[0]; wait["level"] != "info" || wait["reason"] != "WaitingForMaster" || wait["stacktrace"] != nil {
+		t.Errorf("the wait was logged as %v, want at info level with reason WaitingForMaster and no stack trace", wait)
+	}
+	if failed := lines[1]; failed["level"] != "error" {
+		t.Errorf("the failure was logged as %v, want at error level", failed)
+	}
 }

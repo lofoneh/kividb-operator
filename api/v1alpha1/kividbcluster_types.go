@@ -189,11 +189,13 @@ type FailoverSpec struct {
 	// +optional
 	UnhealthyThresholdSeconds *int32 `json:"unhealthyThresholdSeconds,omitempty"`
 
-	// RestartWaitSeconds is how long a failover waits for a master whose
-	// pod is gone, and whose engine no longer answers, to come back on its
-	// volume -- it may hold writes its replicas do not -- before promoting
-	// one of them. Not when its replacement pod cannot be scheduled. 0
-	// turns the wait off. Defaults to 15.
+	// RestartWaitSeconds is how long, at most, a failover waits for a
+	// master whose pod is gone or replaced, and whose engine no longer
+	// answers, to come back on its volume -- it may hold writes its
+	// replicas do not -- before promoting one of them: counted from when it
+	// was found gone, whether its pod comes back or not. Not when its
+	// replacement pod cannot be scheduled. 0 turns the wait off. Defaults
+	// to 15.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	RestartWaitSeconds *int32 `json:"restartWaitSeconds,omitempty"`
